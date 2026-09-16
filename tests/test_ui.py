@@ -272,8 +272,22 @@ class TestPTYInteractive(unittest.TestCase):
         except OSError:
             pass
 
+        t_end = time.monotonic() + 3.0
+        while time.monotonic() < t_end:
+            r, _, _ = select.select([master], [], [], 0.05)
+            if r:
+                try:
+                    data = os.read(master, 1024)
+                    if data:
+                        output_chunks.append(data)
+                except OSError:
+                    break
+            if proc.poll() is not None:
+                break
+
         try:
-            proc.wait(timeout=3.0)
+            if proc.poll() is None:
+                proc.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
             proc.kill()
             self.fail("TUI did not exit within timeout after pressing 'q'")
@@ -322,8 +336,22 @@ class TestPTYInteractive(unittest.TestCase):
         except OSError:
             pass
 
+        t_end = time.monotonic() + 3.0
+        while time.monotonic() < t_end:
+            r, _, _ = select.select([master], [], [], 0.05)
+            if r:
+                try:
+                    data = os.read(master, 1024)
+                    if data:
+                        output_chunks.append(data)
+                except OSError:
+                    break
+            if proc.poll() is not None:
+                break
+
         try:
-            proc.wait(timeout=3.0)
+            if proc.poll() is None:
+                proc.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
             proc.kill()
             self.fail("TUI did not exit within timeout on small terminal")
