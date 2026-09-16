@@ -283,6 +283,7 @@ class MatrixLayoutEngine:
             blocks: dict[str, tuple[int, int, int, int]] = {}
             cells: list[MatrixCell] = []
 
+            # Precalculate block dimensions
             for idx, cat in enumerate(TOPOLOGY_CATEGORIES):
                 r = idx // cols
                 c = idx % cols
@@ -292,6 +293,19 @@ class MatrixLayoutEngine:
                 bh = row_h
                 blocks[cat] = (bx, by, bw, bh)
 
+            # If user did not strictly force "blocks", check if any category overflows capacity
+            if preferred_mode != "blocks":
+                for cat, (bx, by, bw, bh) in blocks.items():
+                    cat_sensors = grouped.get(cat, [])
+                    inner_w = max(1, bw - 2)
+                    inner_h = max(1, bh - 2)
+                    if len(cat_sensors) > inner_w * inner_h:
+                        mode = "compact"
+                        break
+
+        if mode == "blocks":
+            for idx, cat in enumerate(TOPOLOGY_CATEGORIES):
+                bx, by, bw, bh = blocks[cat]
                 cat_sensors = grouped.get(cat, [])
                 inner_left = bx + 1
                 inner_right = bx + bw - 1
@@ -510,7 +524,7 @@ def format_hud(
         l1 = "── HUD: All Sensors Normal (Healthy) "
         l1 = (l1 + "─" * max(0, width - len(l1)))[:width]
         l2 = "   System operational | No anomalies detected"[:width]
-        l3 = "   [Tab] Next Anomaly  [Arrows] Move Cursor  [r] Refresh  [q] Quit"[:width]
+        l3 = "   [Tab] Next Anomaly  [Arrows] Move Cursor  [m/v] Tree View  [r] Refresh  [q] Quit"[:width]
         return [l1, l2, l3]
 
     name = getattr(sensor, "name", "UNKNOWN")
@@ -529,7 +543,7 @@ def format_hud(
     unit_str = f" {unit}" if unit else ""
 
     l2 = f"   Status: {status}{val_str}{unit_str} | Group: {group_str}"[:width]
-    l3 = "   [Tab] Next Anomaly  [Arrows] Move Cursor  [r] Refresh  [q] Quit"[:width]
+    l3 = "   [Tab] Next Anomaly  [Arrows] Move Cursor  [m/v] Tree View  [r] Refresh  [q] Quit"[:width]
     return [l1, l2, l3]
 
 
@@ -587,10 +601,16 @@ def render_matrix_view(
     h1 = f" Total: {tot} | OK: {n_norm} | Warn: {n_warn} | Crit: {n_crit} | Unavail: {n_unav}"
     safe_addstr(win, 1, 0, h1[:max_x])
 
-    # Render category labels
+    # Render category labels with health summaries
     if layout.mode == "blocks":
         for cat, (bx, by, bw, bh) in layout.blocks.items():
-            safe_addstr(win, by, bx, f"[{cat}]"[:bw])
+            cat_cells = [c for c in layout.cells if c.category == cat]
+            tot_c = len(cat_cells)
+            ok_c = sum(1 for c in cat_cells if c.severity == SEVERITY_NORMAL)
+            anom_c = tot_c - ok_c
+            anom_str = f" ({anom_c} non-ok)" if anom_c > 0 else ""
+            lbl = f"[{cat}] {ok_c}/{tot_c} OK{anom_str}" if tot_c > 0 else f"[{cat}]"
+            safe_addstr(win, by, bx, lbl[:bw])
     elif layout.mode == "compact":
         for cat, (bx, by, bw, bh) in layout.blocks.items():
             if bh > 0:

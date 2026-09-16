@@ -320,7 +320,7 @@ def _tui_main(
 
     color_map = {
         SEVERITY_NORMAL: curses.color_pair(1),
-        SEVERITY_UNAVAILABLE: curses.A_DIM,
+        SEVERITY_UNAVAILABLE: curses.color_pair(3) | curses.A_DIM,
         SEVERITY_WARNING: curses.color_pair(3) | curses.A_BOLD,
         SEVERITY_CRITICAL: curses.color_pair(2) | curses.A_BOLD,
     } if curses.has_colors() else None
@@ -363,8 +363,8 @@ def _tui_main(
 
         total_cnt = len(sensors)
         norm_cnt = sum(1 for s in sensors if s.health == "normal")
-        att_cnt = sum(1 for s in sensors if s.health == "attention")
-        unk_cnt = sum(1 for s in sensors if s.health == "unknown")
+        att_cnt = sum(1 for s in sensors if s.health in ("attention", "warning", "critical"))
+        unk_cnt = total_cnt - norm_cnt - att_cnt
 
         tree = build_tree(sensors, collapsed_groups=state.collapsed_groups)
         effective_query = state.search_buffer if state.search_active else state.search_query

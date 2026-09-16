@@ -79,8 +79,8 @@ def run_once(collector: Collector, tracker: Tracker, source_label: str) -> int:
     sensors = tracker.view(now)
     total_cnt = len(sensors)
     norm_cnt = sum(1 for s in sensors if s.health == "normal")
-    att_cnt = sum(1 for s in sensors if s.health == "attention")
-    unk_cnt = sum(1 for s in sensors if s.health == "unknown")
+    att_cnt = sum(1 for s in sensors if s.health in ("attention", "warning", "critical"))
+    unk_cnt = total_cnt - norm_cnt - att_cnt
 
     clean_source = strip_control_codes(source_label)
     print(f"[Source: {clean_source}] [Age: 0.0s]")
