@@ -10,7 +10,16 @@ import subprocess
 import threading
 import time
 
-__all__ = ["CollectionError", "Collector", "DBusCollector", "ssh_command", "dbus_ssh_command"]
+__all__ = [
+    "CollectionError",
+    "Collector",
+    "DBusCollector",
+    "ssh_command",
+    "dbus_ssh_command",
+    "DEFAULT_OPENBMC_PASSWORD",
+]
+
+DEFAULT_OPENBMC_PASSWORD = "0penBmc"
 
 DISALLOWED_SHELL_CHARS = set(";`&|*?~<>^()${}\"'\\")
 
@@ -74,45 +83,62 @@ def _validate_identity(identity: str) -> None:
 
 
 
-def dbus_ssh_command(host: str, remote_cmd: str, port: int = 22, identity: str | None = None) -> list[str]:
+def _build_ssh_base(
+    host: str,
+    port: int = 22,
+    identity: str | None = None,
+    password: str | None = None,
+) -> list[str]:
     _validate_host(host)
     _validate_port(port)
     if identity is not None:
         _validate_identity(identity)
-    if not isinstance(remote_cmd, str) or not remote_cmd.strip():
-        raise ValueError("remote_cmd must be a non-empty string")
 
-    args = [
-        "ssh",
-        "-T",
-        "-o", "BatchMode=yes",
+    cmd: list[str] = []
+    if password is not None:
+        cmd += ["sshpass", "-p", password]
+
+    cmd += ["ssh", "-T"]
+    if password is None:
+        cmd += ["-o", "BatchMode=yes"]
+    else:
+        cmd += [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+        ]
+
+    cmd += [
         "-o", "ConnectTimeout=5",
         "-o", "ServerAliveInterval=5",
         "-o", "ServerAliveCountMax=2",
         "-p", str(port),
     ]
     if identity:
-        args += ["-i", identity]
+        cmd += ["-i", identity]
+    return cmd
+
+
+def dbus_ssh_command(
+    host: str,
+    remote_cmd: str,
+    port: int = 22,
+    identity: str | None = None,
+    password: str | None = None,
+) -> list[str]:
+    if not isinstance(remote_cmd, str) or not remote_cmd.strip():
+        raise ValueError("remote_cmd must be a non-empty string")
+    args = _build_ssh_base(host, port=port, identity=identity, password=password)
     args += [host, remote_cmd]
     return args
 
-def ssh_command(host: str, port: int = 22, identity: str | None = None) -> list[str]:
-    _validate_host(host)
-    _validate_port(port)
-    if identity is not None:
-        _validate_identity(identity)
 
-    args = [
-        "ssh",
-        "-T",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=5",
-        "-o", "ServerAliveInterval=5",
-        "-o", "ServerAliveCountMax=2",
-        "-p", str(port),
-    ]
-    if identity:
-        args += ["-i", identity]
+def ssh_command(
+    host: str,
+    port: int = 22,
+    identity: str | None = None,
+    password: str | None = None,
+) -> list[str]:
+    args = _build_ssh_base(host, port=port, identity=identity, password=password)
     args += [host, "mfg-tool sensor-display"]
     return args
 
@@ -172,6 +198,7 @@ class Collector:
         local: bool = False,
         port: int = 22,
         identity: str | None = None,
+        password: str | None = None,
         timeout: float = 15.0,
     ) -> None:
         active_sources = sum([bool(host), bool(file), bool(demo), bool(local)])
@@ -198,6 +225,7 @@ class Collector:
         self.local = local
         self.port = port
         self.identity = identity
+        self.password = password
         self.timeout = float(timeout)
         self._demo_cycle = 0
 
@@ -249,15 +277,7 @@ class Collector:
         except (OSError, UnicodeError) as e:
             raise CollectionError(f"Failed to read file '{self.file}': {e}") from e
 
-    def _collect_subprocess(self, stop: threading.Event) -> str:
-        if stop.is_set():
-            raise CollectionError("Collection cancelled by stop event")
-
-        if self.host is not None:
-            cmd = ssh_command(self.host, port=self.port, identity=self.identity)
-        else:
-            cmd = ["mfg-tool", "sensor-display"]
-
+    def _run_subprocess_cmd(self, cmd: list[str], stop: threading.Event) -> tuple[int, str, str]:
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -304,12 +324,40 @@ class Collector:
             else:
                 raise CollectionError(f"Collection timed out after {self.timeout}s")
 
-        if proc.returncode != 0:
+        return (proc.returncode, stdout_data, stderr_data)
+
+    def _collect_subprocess(self, stop: threading.Event) -> str:
+        if stop.is_set():
+            raise CollectionError("Collection cancelled by stop event")
+
+        if self.host is not None:
+            cmd = ssh_command(self.host, port=self.port, identity=self.identity, password=self.password)
+        else:
+            cmd = ["mfg-tool", "sensor-display"]
+
+        rc, stdout_data, stderr_data = self._run_subprocess_cmd(cmd, stop)
+
+        # If authentication failed (Permission denied) and no explicit password was given,
+        # automatically attempt fallback with default OpenBMC password '0penBmc'.
+        if rc != 0 and self.host is not None and self.password is None:
+            if "Permission denied" in (stderr_data or ""):
+                fallback_cmd = ssh_command(
+                    self.host,
+                    port=self.port,
+                    identity=self.identity,
+                    password=DEFAULT_OPENBMC_PASSWORD,
+                )
+                rc_fb, stdout_fb, stderr_fb = self._run_subprocess_cmd(fallback_cmd, stop)
+                if rc_fb == 0:
+                    self.password = DEFAULT_OPENBMC_PASSWORD
+                    return stdout_fb
+
+        if rc != 0:
             stderr_tail = (stderr_data or "")[-2000:].strip()
             if stderr_tail:
-                msg = f"Command failed with exit code {proc.returncode}: {stderr_tail}"
+                msg = f"Command failed with exit code {rc}: {stderr_tail}"
             else:
-                msg = f"Command failed with exit code {proc.returncode}"
+                msg = f"Command failed with exit code {rc}"
             raise CollectionError(msg)
 
         return stdout_data
@@ -330,6 +378,7 @@ class DBusCollector:
         local: bool = False,
         port: int = 22,
         identity: str | None = None,
+        password: str | None = None,
         timeout: float = 15.0,
         per_daemon_timeout: float = 3.0,
         cmd_runner: Any = None,
@@ -356,6 +405,7 @@ class DBusCollector:
         self.local = local
         self.port = port
         self.identity = identity
+        self.password = password
         self.timeout = float(timeout)
         self.per_daemon_timeout = float(per_daemon_timeout)
         self.cmd_runner = cmd_runner
@@ -384,7 +434,13 @@ class DBusCollector:
 
     def _make_cmd(self, remote_cmd: str, local_args: list[str]) -> list[str]:
         if self.host is not None:
-            return dbus_ssh_command(self.host, remote_cmd, port=self.port, identity=self.identity)
+            return dbus_ssh_command(
+                self.host,
+                remote_cmd,
+                port=self.port,
+                identity=self.identity,
+                password=self.password,
+            )
         return local_args
 
     def collect_sensors(self, stop: threading.Event) -> dict[str, Any]:
@@ -420,6 +476,21 @@ class DBusCollector:
             raise CollectionError(f"D-Bus GetSubTree timed out after {self.timeout}s") from e
         except Exception as e:
             raise CollectionError(f"Failed to query ObjectMapper: {e}") from e
+
+        # Auto-fallback to default password if SSH permission denied
+        if rc != 0 and self.host is not None and self.password is None:
+            if "Permission denied" in (stderr or ""):
+                fallback_cmd = dbus_ssh_command(
+                    self.host,
+                    subtree_call,
+                    port=self.port,
+                    identity=self.identity,
+                    password=DEFAULT_OPENBMC_PASSWORD,
+                )
+                rc_fb, stdout_fb, stderr_fb = self._exec(fallback_cmd, timeout=self.timeout)
+                if rc_fb == 0:
+                    self.password = DEFAULT_OPENBMC_PASSWORD
+                    rc, stdout, stderr = rc_fb, stdout_fb, stderr_fb
 
         if rc != 0:
             raise CollectionError(f"ObjectMapper GetSubTree failed (exit {rc}): {stderr.strip()}")

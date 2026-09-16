@@ -40,6 +40,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stale-after", type=float, default=10.0, help="Stale threshold in seconds")
     parser.add_argument("--port", type=int, default=22, help="SSH port")
     parser.add_argument("--identity", type=str, default=None, help="SSH identity key file")
+    parser.add_argument("--password", type=str, default=None, help="SSH password (optional; auto-attempts 0penBmc if key fails)")
     parser.add_argument("--once", action="store_true", help="Print single snapshot to stdout and exit")
     return parser
 
@@ -154,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
                 local=args.local,
                 port=args.port,
                 identity=args.identity,
+                password=args.password,
                 timeout=args.timeout,
             )
         else:
@@ -164,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             local=args.local,
             port=args.port,
             identity=args.identity,
+            password=args.password,
             timeout=args.timeout,
         )
     except ValueError as ve:

@@ -316,7 +316,8 @@ class MatrixLayoutEngine:
                         severity=sev,
                     ))
 
-            cells.sort(key=lambda c: c.sensor_index)
+            # Keep cells ordered by layout category/grouping for contiguous navigation
+            # (cells were appended category by category, line by line)
             return MatrixLayoutResult(
                 mode="blocks",
                 is_too_small=False,
@@ -369,7 +370,8 @@ class MatrixLayoutEngine:
             blocks[cat] = (0, start_y, width, block_h)
             current_y += num_lines
 
-        cells.sort(key=lambda c: c.sensor_index)
+            # Keep cells ordered by layout category/grouping for contiguous navigation
+            # (cells were appended category by category, line by line)
         return MatrixLayoutResult(
             mode="compact",
             is_too_small=False,
@@ -384,26 +386,41 @@ class MatrixLayoutEngine:
 
 def navigate_cursor(
     direction: str,
-    current_index: int,
+    current_sensor_index: int,
     layout: MatrixLayoutResult,
 ) -> int:
-    """Navigate cursor in 2D space across matrix cells."""
+    """Navigate cursor in 2D space across matrix cells.
+
+    Takes current_sensor_index (pointing to the original sensor list),
+    maps it to the cell in the layout, navigates along layout order (LEFT/RIGHT)
+    or spatial 2D coordinates (UP/DOWN), and returns the new sensor_index.
+    """
     if not layout.cells:
         return 0
 
-    current_index = max(0, min(len(layout.cells) - 1, current_index))
-    cur_cell = layout.cells[current_index]
+    # Locate current cell index in layout.cells by sensor_index
+    cell_idx = 0
+    for idx, c in enumerate(layout.cells):
+        if c.sensor_index == current_sensor_index:
+            cell_idx = idx
+            break
+    else:
+        cell_idx = max(0, min(len(layout.cells) - 1, current_sensor_index))
+
+    cur_cell = layout.cells[cell_idx]
 
     if direction == "LEFT":
-        return max(0, current_index - 1)
+        next_cell_idx = max(0, cell_idx - 1)
+        return layout.cells[next_cell_idx].sensor_index
     elif direction == "RIGHT":
-        return min(len(layout.cells) - 1, current_index + 1)
+        next_cell_idx = min(len(layout.cells) - 1, cell_idx + 1)
+        return layout.cells[next_cell_idx].sensor_index
     elif direction == "UP":
         cur_y = cur_cell.y
         cur_x = cur_cell.x
         cells_above = [c for c in layout.cells if c.y < cur_y]
         if not cells_above:
-            return current_index
+            return cur_cell.sensor_index
         max_prev_y = max(c.y for c in cells_above)
         row_cells = [c for c in cells_above if c.y == max_prev_y]
         best = min(row_cells, key=lambda c: (abs(c.x - cur_x), c.sensor_index))
@@ -413,13 +430,13 @@ def navigate_cursor(
         cur_x = cur_cell.x
         cells_below = [c for c in layout.cells if c.y > cur_y]
         if not cells_below:
-            return current_index
+            return cur_cell.sensor_index
         min_next_y = min(c.y for c in cells_below)
         row_cells = [c for c in cells_below if c.y == min_next_y]
         best = min(row_cells, key=lambda c: (abs(c.x - cur_x), c.sensor_index))
         return best.sensor_index
 
-    return current_index
+    return cur_cell.sensor_index
 
 
 def safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> bool:

@@ -34,6 +34,50 @@ def fake_mfg_tool(script_body: str):
 
 
 class TestSshCommand(unittest.TestCase):
+
+    def test_ssh_command_with_password(self):
+        args = ssh_command("root@192.0.2.1", password="my_password")
+        self.assertEqual(args[:3], ["sshpass", "-p", "my_password"])
+        self.assertIn("ssh", args)
+        self.assertIn("-T", args)
+        self.assertNotIn("BatchMode=yes", args)
+        self.assertIn("StrictHostKeyChecking=no", args)
+        self.assertEqual(args[-1], "mfg-tool sensor-display")
+
+    def test_collector_auto_fallback_to_default_password(self):
+        commands_run = []
+        class MockPopen:
+            def __init__(self, cmd, *args, **kwargs):
+                commands_run.append(cmd)
+                self.pid = 9999
+                if "sshpass" in cmd:
+                    self.returncode = 0
+                    self.stdout_val = chr(123) + chr(34) + "TEST_SENSOR" + chr(34) + ": " + chr(123) + chr(34) + "status" + chr(34) + ": " + chr(34) + "ok" + chr(34) + chr(125) + chr(125)
+                    self.stderr_val = ""
+                else:
+                    self.returncode = 255
+                    self.stdout_val = ""
+                    self.stderr_val = "Permission denied (publickey,password)."
+
+            def communicate(self, timeout=None):
+                return (self.stdout_val, self.stderr_val)
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        collector = Collector(host="root@192.0.2.1")
+        stop = threading.Event()
+        import unittest.mock
+        with unittest.mock.patch("subprocess.Popen", side_effect=MockPopen):
+            res = collector.collect(stop)
+            self.assertIn("TEST_SENSOR", res)
+            self.assertEqual(collector.password, "0penBmc")
+            self.assertEqual(len(commands_run), 2)
+            self.assertNotIn("sshpass", commands_run[0])
+            self.assertIn("sshpass", commands_run[1])
     def test_ssh_is_readonly_and_noninteractive(self):
         args = ssh_command("root@192.0.2.1")
         self.assertIn("-T", args)

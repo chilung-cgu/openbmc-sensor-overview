@@ -242,6 +242,25 @@ class TestDBusCollectorParsing(unittest.TestCase):
 
 
 class TestDBusCollectorRunner(unittest.TestCase):
+
+    def test_dbus_collector_auto_fallback_to_default_password(self):
+        calls = []
+        def fake_runner(cmd, timeout):
+            calls.append(cmd)
+            if "sshpass" in cmd:
+                # Success on fallback
+                return (0, chr(123) + chr(34) + "data" + chr(34) + ": [" + chr(123) + chr(34) + "/xyz/openbmc_project/sensors/temperature/dummy" + chr(34) + ": " + chr(123) + chr(34) + "xyz.openbmc_project.Hwmon" + chr(34) + ": []" + chr(125) + chr(125) + "]}", "")
+            else:
+                return (255, "", "Permission denied (publickey,password).")
+
+        col = DBusCollector(host="root@192.0.2.1", cmd_runner=fake_runner)
+        stop = threading.Event()
+        # Collect will query ObjectMapper, trigger fallback, then attempt managed objects
+        sensors = col.collect_sensors(stop)
+        self.assertEqual(col.password, "0penBmc")
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertNotIn("sshpass", calls[0])
+        self.assertIn("sshpass", calls[1])
     def test_ssh_command_building(self):
         cmd = dbus_ssh_command("root@192.0.2.1", "busctl --json=pretty call ...", port=2222, identity="/path/to/key")
         self.assertIn("ssh", cmd[0])
