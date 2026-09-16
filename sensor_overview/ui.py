@@ -5,6 +5,21 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from sensor_overview.matrix_view import (
+    GLYPHS_ASCII,
+    GLYPHS_UNICODE,
+    MatrixLayoutEngine,
+    MatrixState,
+    SEVERITY_CRITICAL,
+    SEVERITY_NORMAL,
+    SEVERITY_UNAVAILABLE,
+    SEVERITY_WARNING,
+    find_most_severe_sensor,
+    find_next_abnormal_index,
+    navigate_cursor,
+    render_matrix_view,
+)
+
 from typing import Any, Iterable
 
 CONTROL_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
@@ -253,7 +268,10 @@ def format_selected_detail(row: RenderRow | None, max_width: int) -> tuple[str, 
 
 
 class TUIState:
-    def __init__(self):
+    def __init__(self, initial_view: str = "matrix"):
+        self.view_mode: str = initial_view  # "matrix" or "tree"
+        self.matrix_state: MatrixState = MatrixState()
+        self.matrix_engine: MatrixLayoutEngine = MatrixLayoutEngine()
         self.collapsed_groups: set[tuple[str, ...]] = set()
         self.selected_index: int = 0
         self.scroll_offset: int = 0
@@ -269,8 +287,9 @@ def run_tui(
     stop_event: threading.Event,
     source_label: str,
     interval: float,
+    initial_view: str = "matrix",
 ) -> None:
-    curses.wrapper(lambda stdscr: _tui_main(stdscr, tracker, collector_queue, stop_event, source_label, interval))
+    curses.wrapper(lambda stdscr: _tui_main(stdscr, tracker, collector_queue, stop_event, source_label, interval, initial_view))
 
 
 def _tui_main(
@@ -280,6 +299,7 @@ def _tui_main(
     stop_event: threading.Event,
     source_label: str,
     interval: float,
+    initial_view: str = "matrix",
 ) -> None:
     try:
         curses.curs_set(0)
@@ -298,7 +318,14 @@ def _tui_main(
         curses.init_pair(6, curses.COLOR_RED, curses.COLOR_WHITE)
         curses.init_pair(7, curses.COLOR_YELLOW, curses.COLOR_WHITE)
 
-    state = TUIState()
+    color_map = {
+        SEVERITY_NORMAL: curses.color_pair(1),
+        SEVERITY_UNAVAILABLE: curses.A_DIM,
+        SEVERITY_WARNING: curses.color_pair(3) | curses.A_BOLD,
+        SEVERITY_CRITICAL: curses.color_pair(2) | curses.A_BOLD,
+    } if curses.has_colors() else None
+
+    state = TUIState(initial_view=initial_view)
     conn_status = "Initializing..."
     last_duration: float | None = None
 
@@ -367,178 +394,188 @@ def _tui_main(
                 break
             continue
 
-        # Header lines (0, 1, 2)
-        top_hdr, cnt_hdr = format_header(
-            source_label,
-            conn_status,
-            age,
-            last_duration,
-            tracker.stale_after,
-            total_cnt,
-            norm_cnt,
-            att_cnt,
-            unk_cnt,
-            max_width=max_x - 1,
-        )
-        try:
-            stdscr.addstr(0, 0, top_hdr[:max_x - 1], curses.A_BOLD | (curses.color_pair(4) if curses.has_colors() else 0))
-            stdscr.addstr(1, 0, cnt_hdr[:max_x - 1])
-            stdscr.addstr(2, 0, "-" * (max_x - 1))
-        except curses.error:
-            pass
-
-        # Calculate section budgets
-        # Header: 3 lines (0, 1, 2)
-        # Footer: 4 lines (separator, 2 detail lines, command bar)
-        # Issues summary: 2-3 lines
-        # Recent events: 2-3 lines if max_y >= 22
-        issues_lines = 3 if max_y >= 20 else 2
-        events_lines = (3 if max_y >= 25 else 2) if max_y >= 22 else 0
-        footer_height = 4
-
-        list_top = 3
-        list_height = max(1, max_y - list_top - footer_height - issues_lines - (events_lines + 1 if events_lines > 0 else 0))
-
-        if not rows:
-            state.selected_index = 0
-            state.scroll_offset = 0
+        if state.view_mode == "matrix":
+            render_matrix_view(
+                stdscr,
+                sensors,
+                state=state.matrix_state,
+                engine=state.matrix_engine,
+                color_map=color_map,
+                use_unicode=True,
+            )
         else:
-            state.selected_index = max(0, min(state.selected_index, len(rows) - 1))
-            if state.selected_index < state.scroll_offset:
-                state.scroll_offset = state.selected_index
-            elif state.selected_index >= state.scroll_offset + list_height:
-                state.scroll_offset = state.selected_index - list_height + 1
-
-        # Render Tree rows
-        for idx in range(list_height):
-            row_idx = state.scroll_offset + idx
-            if row_idx >= len(rows):
-                break
-            row = rows[row_idx]
-            is_selected = (row_idx == state.selected_index)
-            line_y = list_top + idx
-            indent = "  " * row.depth
-
-            if row.is_group:
-                text_line = indent + row.node.format_label()
-                # Aggregate health color for parent groups
-                if is_selected:
-                    if row.node.attention_count > 0:
-                        attr = curses.color_pair(6) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
-                    elif row.node.unknown_count > 0:
-                        attr = curses.color_pair(7) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
-                    else:
-                        attr = curses.color_pair(5) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
-                else:
-                    if row.node.attention_count > 0:
-                        attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
-                    elif row.node.unknown_count > 0:
-                        attr = curses.color_pair(3) | curses.A_BOLD if curses.has_colors() else 0
-                    else:
-                        attr = curses.color_pair(1) if curses.has_colors() else 0
-
-                text_line = strip_control_codes(text_line)[:max_x - 1]
-                try:
-                    stdscr.addstr(line_y, 0, text_line.ljust(max_x - 1), attr)
-                except curses.error:
-                    pass
+            # Header lines (0, 1, 2)
+            top_hdr, cnt_hdr = format_header(
+                source_label,
+                conn_status,
+                age,
+                last_duration,
+                tracker.stale_after,
+                total_cnt,
+                norm_cnt,
+                att_cnt,
+                unk_cnt,
+                max_width=max_x - 1,
+            )
+            try:
+                stdscr.addstr(0, 0, top_hdr[:max_x - 1], curses.A_BOLD | (curses.color_pair(4) if curses.has_colors() else 0))
+                stdscr.addstr(1, 0, cnt_hdr[:max_x - 1])
+                stdscr.addstr(2, 0, "-" * (max_x - 1))
+            except curses.error:
+                pass
+    
+            # Calculate section budgets
+            # Header: 3 lines (0, 1, 2)
+            # Footer: 4 lines (separator, 2 detail lines, command bar)
+            # Issues summary: 2-3 lines
+            # Recent events: 2-3 lines if max_y >= 22
+            issues_lines = 3 if max_y >= 20 else 2
+            events_lines = (3 if max_y >= 25 else 2) if max_y >= 22 else 0
+            footer_height = 4
+    
+            list_top = 3
+            list_height = max(1, max_y - list_top - footer_height - issues_lines - (events_lines + 1 if events_lines > 0 else 0))
+    
+            if not rows:
+                state.selected_index = 0
+                state.scroll_offset = 0
             else:
-                sensor = row.sensor
-                status_char = "O" if sensor.health == "normal" else ("!" if sensor.health == "attention" else "?")
-                prefix = f"{indent}[{status_char}] {row.name}"
-                suffix = f" {sensor.status}"
-                dots_len = max(2, max_x - 1 - len(prefix) - len(suffix))
-                line_str = prefix + ("." * dots_len) + suffix
-                line_str = strip_control_codes(line_str)[:max_x - 1]
-
-                if is_selected:
-                    attr = curses.color_pair(6 if sensor.health == "attention" else 5) if curses.has_colors() else curses.A_REVERSE
-                else:
-                    if sensor.health == "normal":
-                        attr = curses.color_pair(1) if curses.has_colors() else 0
-                    elif sensor.health == "attention":
-                        attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                state.selected_index = max(0, min(state.selected_index, len(rows) - 1))
+                if state.selected_index < state.scroll_offset:
+                    state.scroll_offset = state.selected_index
+                elif state.selected_index >= state.scroll_offset + list_height:
+                    state.scroll_offset = state.selected_index - list_height + 1
+    
+            # Render Tree rows
+            for idx in range(list_height):
+                row_idx = state.scroll_offset + idx
+                if row_idx >= len(rows):
+                    break
+                row = rows[row_idx]
+                is_selected = (row_idx == state.selected_index)
+                line_y = list_top + idx
+                indent = "  " * row.depth
+    
+                if row.is_group:
+                    text_line = indent + row.node.format_label()
+                    # Aggregate health color for parent groups
+                    if is_selected:
+                        if row.node.attention_count > 0:
+                            attr = curses.color_pair(6) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
+                        elif row.node.unknown_count > 0:
+                            attr = curses.color_pair(7) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
+                        else:
+                            attr = curses.color_pair(5) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
                     else:
-                        attr = curses.color_pair(3) if curses.has_colors() else 0
-
-                try:
-                    stdscr.addstr(line_y, 0, line_str.ljust(max_x - 1), attr)
-                except curses.error:
-                    pass
-
-        cur_y = list_top + list_height
-
-        # Fixed Visible Issues Summary (independent of tree viewport)
-        non_normal_sensors = [s for s in sensors if s.health != "normal"]
-        try:
-            stdscr.addstr(cur_y, 0, "-" * (max_x - 1))
-            cur_y += 1
-            if not non_normal_sensors:
-                issue_header = "Active Issues: (None - all sensors normal)"
-                stdscr.addstr(cur_y, 0, issue_header[:max_x - 1], curses.color_pair(1) if curses.has_colors() else curses.A_DIM)
-                cur_y += 1
-            else:
-                issue_header = f"Active Issues ({len(non_normal_sensors)} non-normal):"
-                stdscr.addstr(cur_y, 0, issue_header[:max_x - 1], curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD)
-                cur_y += 1
-
-                max_items = issues_lines - 1
-                for i in range(min(max_items, len(non_normal_sensors))):
-                    if cur_y >= max_y - footer_height - (events_lines + 1 if events_lines > 0 else 0):
-                        break
-                    iss = non_normal_sensors[i]
-                    sym = "!" if iss.health == "attention" else "?"
-                    more_str = f" (+{len(non_normal_sensors) - i - 1} more)" if (i == max_items - 1 and len(non_normal_sensors) > max_items) else ""
-                    iss_line = f"  [{sym}] {iss.name}: {iss.status} ({iss.health}){more_str}"
-                    attr = curses.color_pair(2 if iss.health == "attention" else 3) if curses.has_colors() else 0
-                    stdscr.addstr(cur_y, 0, strip_control_codes(iss_line)[:max_x - 1], attr)
-                    cur_y += 1
-        except curses.error:
-            pass
-
-        # Recent Events Section (if height permits)
-        if events_lines > 0 and cur_y < max_y - footer_height:
+                        if row.node.attention_count > 0:
+                            attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                        elif row.node.unknown_count > 0:
+                            attr = curses.color_pair(3) | curses.A_BOLD if curses.has_colors() else 0
+                        else:
+                            attr = curses.color_pair(1) if curses.has_colors() else 0
+    
+                    text_line = strip_control_codes(text_line)[:max_x - 1]
+                    try:
+                        stdscr.addstr(line_y, 0, text_line.ljust(max_x - 1), attr)
+                    except curses.error:
+                        pass
+                else:
+                    sensor = row.sensor
+                    status_char = "O" if sensor.health == "normal" else ("!" if sensor.health == "attention" else "?")
+                    prefix = f"{indent}[{status_char}] {row.name}"
+                    suffix = f" {sensor.status}"
+                    dots_len = max(2, max_x - 1 - len(prefix) - len(suffix))
+                    line_str = prefix + ("." * dots_len) + suffix
+                    line_str = strip_control_codes(line_str)[:max_x - 1]
+    
+                    if is_selected:
+                        attr = curses.color_pair(6 if sensor.health == "attention" else 5) if curses.has_colors() else curses.A_REVERSE
+                    else:
+                        if sensor.health == "normal":
+                            attr = curses.color_pair(1) if curses.has_colors() else 0
+                        elif sensor.health == "attention":
+                            attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                        else:
+                            attr = curses.color_pair(3) if curses.has_colors() else 0
+    
+                    try:
+                        stdscr.addstr(line_y, 0, line_str.ljust(max_x - 1), attr)
+                    except curses.error:
+                        pass
+    
+            cur_y = list_top + list_height
+    
+            # Fixed Visible Issues Summary (independent of tree viewport)
+            non_normal_sensors = [s for s in sensors if s.health != "normal"]
             try:
                 stdscr.addstr(cur_y, 0, "-" * (max_x - 1))
                 cur_y += 1
-                recent_events = list(tracker.events)[-(events_lines - 1):]
-                if not recent_events:
-                    stdscr.addstr(cur_y, 0, "Recent Events: (None)"[:max_x - 1], curses.A_DIM)
+                if not non_normal_sensors:
+                    issue_header = "Active Issues: (None - all sensors normal)"
+                    stdscr.addstr(cur_y, 0, issue_header[:max_x - 1], curses.color_pair(1) if curses.has_colors() else curses.A_DIM)
                     cur_y += 1
                 else:
-                    for ev in recent_events:
-                        if cur_y >= max_y - footer_height:
+                    issue_header = f"Active Issues ({len(non_normal_sensors)} non-normal):"
+                    stdscr.addstr(cur_y, 0, issue_header[:max_x - 1], curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD)
+                    cur_y += 1
+    
+                    max_items = issues_lines - 1
+                    for i in range(min(max_items, len(non_normal_sensors))):
+                        if cur_y >= max_y - footer_height - (events_lines + 1 if events_lines > 0 else 0):
                             break
-                        rel_sec = now - ev.at
-                        ev_line = f"  [-{rel_sec:.1f}s] {ev.name}: {ev.before} -> {ev.after}"
-                        stdscr.addstr(cur_y, 0, strip_control_codes(ev_line)[:max_x - 1], curses.A_DIM)
+                        iss = non_normal_sensors[i]
+                        sym = "!" if iss.health == "attention" else "?"
+                        more_str = f" (+{len(non_normal_sensors) - i - 1} more)" if (i == max_items - 1 and len(non_normal_sensors) > max_items) else ""
+                        iss_line = f"  [{sym}] {iss.name}: {iss.status} ({iss.health}){more_str}"
+                        attr = curses.color_pair(2 if iss.health == "attention" else 3) if curses.has_colors() else 0
+                        stdscr.addstr(cur_y, 0, strip_control_codes(iss_line)[:max_x - 1], attr)
                         cur_y += 1
             except curses.error:
                 pass
-
-        # Footer Area: Separator, 2-line detail, command line
-        footer_y = max_y - 3
-        try:
-            stdscr.addstr(footer_y - 1, 0, "-" * (max_x - 1))
-
-            sel_row = rows[state.selected_index] if (rows and 0 <= state.selected_index < len(rows)) else None
-            det_l1, det_l2 = format_selected_detail(sel_row, max_x - 1)
-
-            stdscr.addstr(footer_y, 0, det_l1, curses.A_BOLD)
-            stdscr.addstr(footer_y + 1, 0, det_l2)
-
-            cmd_y = max_y - 1
-            if state.search_active:
-                search_bar = f"Search: {state.search_buffer}_ (Enter: apply, Esc: cancel)"
-                stdscr.addstr(cmd_y, 0, strip_control_codes(search_bar)[:max_x - 1], curses.A_REVERSE)
-            else:
-                filter_hint = " [FILTER: NON-NORMAL]" if state.filter_attention else ""
-                search_hint = f" [SEARCH: {state.search_query}]" if state.search_query else ""
-                bar = f"[q]uit  [a]ttention  [/]search  [Enter/Space]toggle  [j/k]move{filter_hint}{search_hint}"
-                stdscr.addstr(cmd_y, 0, strip_control_codes(bar)[:max_x - 1])
-        except curses.error:
-            pass
-
+    
+            # Recent Events Section (if height permits)
+            if events_lines > 0 and cur_y < max_y - footer_height:
+                try:
+                    stdscr.addstr(cur_y, 0, "-" * (max_x - 1))
+                    cur_y += 1
+                    recent_events = list(tracker.events)[-(events_lines - 1):]
+                    if not recent_events:
+                        stdscr.addstr(cur_y, 0, "Recent Events: (None)"[:max_x - 1], curses.A_DIM)
+                        cur_y += 1
+                    else:
+                        for ev in recent_events:
+                            if cur_y >= max_y - footer_height:
+                                break
+                            rel_sec = now - ev.at
+                            ev_line = f"  [-{rel_sec:.1f}s] {ev.name}: {ev.before} -> {ev.after}"
+                            stdscr.addstr(cur_y, 0, strip_control_codes(ev_line)[:max_x - 1], curses.A_DIM)
+                            cur_y += 1
+                except curses.error:
+                    pass
+    
+            # Footer Area: Separator, 2-line detail, command line
+            footer_y = max_y - 3
+            try:
+                stdscr.addstr(footer_y - 1, 0, "-" * (max_x - 1))
+    
+                sel_row = rows[state.selected_index] if (rows and 0 <= state.selected_index < len(rows)) else None
+                det_l1, det_l2 = format_selected_detail(sel_row, max_x - 1)
+    
+                stdscr.addstr(footer_y, 0, det_l1, curses.A_BOLD)
+                stdscr.addstr(footer_y + 1, 0, det_l2)
+    
+                cmd_y = max_y - 1
+                if state.search_active:
+                    search_bar = f"Search: {state.search_buffer}_ (Enter: apply, Esc: cancel)"
+                    stdscr.addstr(cmd_y, 0, strip_control_codes(search_bar)[:max_x - 1], curses.A_REVERSE)
+                else:
+                    filter_hint = " [FILTER: NON-NORMAL]" if state.filter_attention else ""
+                    search_hint = f" [SEARCH: {state.search_query}]" if state.search_query else ""
+                    bar = f"[q]uit  [a]ttention  [/]search  [Enter/Space]toggle  [j/k]move{filter_hint}{search_hint}"
+                    stdscr.addstr(cmd_y, 0, strip_control_codes(bar)[:max_x - 1])
+            except curses.error:
+                pass
+    
         stdscr.refresh()
 
         try:
@@ -572,6 +609,60 @@ def _tui_main(
                 state.search_buffer += chr(ch)
             continue
 
+        if state.view_mode == "matrix":
+            if ch in (ord("q"), ord("Q")):
+                stop_event.set()
+                break
+            elif ch in (ord("m"), ord("M"), ord("v"), ord("V")):
+                state.view_mode = "tree"
+                stdscr.clear()
+            elif ch in (ord("	"), 9):
+                state.matrix_state.auto_locked = False
+                nxt = find_next_abnormal_index(sensors, state.matrix_state.cursor_index)
+                if nxt is not None:
+                    state.matrix_state.cursor_index = nxt
+            elif ch in (curses.KEY_BTAB,):
+                state.matrix_state.auto_locked = False
+                nxt = find_next_abnormal_index(sensors, state.matrix_state.cursor_index, reverse=True)
+                if nxt is not None:
+                    state.matrix_state.cursor_index = nxt
+            elif ch in (curses.KEY_LEFT, ord("h"), ord("H")):
+                state.matrix_state.auto_locked = False
+                layout = state.matrix_engine.compute_layout(sensors, max_x, max_y, preferred_mode=state.matrix_state.preferred_mode)
+                state.matrix_state.cursor_index = navigate_cursor("LEFT", state.matrix_state.cursor_index, layout)
+            elif ch in (curses.KEY_RIGHT, ord("l"), ord("L")):
+                state.matrix_state.auto_locked = False
+                layout = state.matrix_engine.compute_layout(sensors, max_x, max_y, preferred_mode=state.matrix_state.preferred_mode)
+                state.matrix_state.cursor_index = navigate_cursor("RIGHT", state.matrix_state.cursor_index, layout)
+            elif ch in (curses.KEY_UP, ord("k"), ord("K")):
+                state.matrix_state.auto_locked = False
+                layout = state.matrix_engine.compute_layout(sensors, max_x, max_y, preferred_mode=state.matrix_state.preferred_mode)
+                state.matrix_state.cursor_index = navigate_cursor("UP", state.matrix_state.cursor_index, layout)
+            elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
+                state.matrix_state.auto_locked = False
+                layout = state.matrix_engine.compute_layout(sensors, max_x, max_y, preferred_mode=state.matrix_state.preferred_mode)
+                state.matrix_state.cursor_index = navigate_cursor("DOWN", state.matrix_state.cursor_index, layout)
+            elif ch in (ord("a"), ord("A")):
+                state.matrix_state.auto_locked = not state.matrix_state.auto_locked
+                if state.matrix_state.auto_locked:
+                    most_sev_idx, _ = find_most_severe_sensor(sensors, anomalies_only=True)
+                    if most_sev_idx is not None:
+                        state.matrix_state.cursor_index = most_sev_idx
+            elif ch in (ord("p"), ord("P")):
+                if state.matrix_state.preferred_mode == "blocks":
+                    state.matrix_state.preferred_mode = "compact"
+                elif state.matrix_state.preferred_mode == "compact":
+                    state.matrix_state.preferred_mode = None
+                else:
+                    state.matrix_state.preferred_mode = "blocks"
+                stdscr.clear()
+            continue
+
+        # Tree View Keys
+        if ch in (ord("m"), ord("M"), ord("v"), ord("V")):
+            state.view_mode = "matrix"
+            stdscr.clear()
+            continue
         if ch in (ord('q'), ord('Q')):
             stop_event.set()
             break

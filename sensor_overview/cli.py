@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any
 
-from sensor_overview.collector import CollectionError, Collector
+from sensor_overview.collector import CollectionError, Collector, DBusCollector
 from sensor_overview.model import Event, Sensor, Tracker
 
 CONTROL_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
@@ -33,6 +33,8 @@ def create_parser() -> argparse.ArgumentParser:
     src_group.add_argument("--file", type=str, help="Path to sensor JSON file")
     src_group.add_argument("--local", action="store_true", help="Run locally using mfg-tool")
 
+    parser.add_argument("--backend", choices=["dbus", "mfg-tool"], default="mfg-tool", help="Data collection backend (dbus: standard OpenBMC, mfg-tool: downstream legacy)")
+    parser.add_argument("--view", choices=["matrix", "tree"], default="matrix", help="Initial display view mode (matrix or tree)")
     parser.add_argument("--interval", type=float, default=2.0, help="Polling interval in seconds")
     parser.add_argument("--timeout", type=float, default=15.0, help="Query timeout in seconds")
     parser.add_argument("--stale-after", type=float, default=10.0, help="Stale threshold in seconds")
@@ -146,7 +148,16 @@ def main(argv: list[str] | None = None) -> int:
         source_label = "UNKNOWN"
 
     try:
-        collector = Collector(
+        if args.backend == "dbus" and (args.host or args.local):
+            collector = DBusCollector(
+                host=args.host,
+                local=args.local,
+                port=args.port,
+                identity=args.identity,
+                timeout=args.timeout,
+            )
+        else:
+            collector = Collector(
             host=args.host,
             file=args.file,
             demo=args.demo,
@@ -200,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     worker_thread = threading.Thread(target=background_worker, daemon=True)
     try:
         worker_thread.start()
-        run_tui(tracker, col_queue, stop_event, source_label, args.interval)
+        run_tui(tracker, col_queue, stop_event, source_label, args.interval, initial_view=args.view)
     except curses.error as ce:
         sys.stderr.write(f"Terminal error: {strip_control_codes(str(ce))}\n")
         return 1

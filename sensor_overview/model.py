@@ -6,21 +6,52 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "HealthState",
     "Sensor",
     "Event",
     "group_name",
     "parse_snapshot",
+    "parse_dbus_sensor",
+    "parse_dbus_managed_objects",
+    "parse_dbus_snapshot",
     "Tracker",
 ]
+
+
+class HealthState(str):
+    NORMAL: "HealthState"
+    WARNING: "HealthState"
+    CRITICAL: "HealthState"
+    UNAVAILABLE: "HealthState"
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, str):
+            return self.lower() == other.lower()
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.lower())
+
+
+HealthState.NORMAL = HealthState("normal")
+HealthState.WARNING = HealthState("warning")
+HealthState.CRITICAL = HealthState("critical")
+HealthState.UNAVAILABLE = HealthState("unavailable")
 
 
 @dataclass(frozen=True)
 class Sensor:
     name: str
     status: str       # effective status: ok/critical/.../missing/stale/invalid value
-    health: str       # normal/attention/unknown
+    health: str       # normal/attention/unknown or HealthState
     group: tuple[str, ...]
     raw_status: str
+    value: float | None = None
+    functional: bool = True
+    available: bool = True
+    unit: str = ""
+    path: str = ""
+    thresholds: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +133,148 @@ def _is_valid_finite(val: Any) -> bool:
         return False
 
 
+def _unwrap_dbus_val(val: Any) -> Any:
+    if isinstance(val, dict) and "data" in val:
+        return val["data"]
+    return val
+
+
+def _get_prop(interfaces: dict[str, Any], iface: str, prop: str) -> Any:
+    if iface in interfaces and isinstance(interfaces[iface], dict):
+        if prop in interfaces[iface]:
+            return _unwrap_dbus_val(interfaces[iface][prop])
+    if prop in interfaces:
+        return _unwrap_dbus_val(interfaces[prop])
+    return None
+
+
+def parse_dbus_sensor(path: str, interfaces: dict[str, Any]) -> Sensor:
+    name = path.rstrip("/").split("/")[-1]
+    raw_val = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Value", "Value")
+    unit = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Value", "Unit") or ""
+
+    avail_val = _get_prop(interfaces, "xyz.openbmc_project.State.Decorator.Availability", "Available")
+    if avail_val is None:
+        avail_val = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Value", "Available")
+    available = True if avail_val is None else bool(avail_val)
+
+    func_val = _get_prop(interfaces, "xyz.openbmc_project.State.Decorator.OperationalStatus", "Functional")
+    if func_val is None:
+        func_val = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Value", "Functional")
+    functional = True if func_val is None else bool(func_val)
+
+    crit_high = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Critical", "CriticalHigh")
+    crit_low = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Critical", "CriticalLow")
+    crit_alarm_high = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Critical", "CriticalAlarmHigh")
+    crit_alarm_low = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Critical", "CriticalAlarmLow")
+
+    warn_high = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Warning", "WarningHigh")
+    warn_low = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Warning", "WarningLow")
+    warn_alarm_high = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Warning", "WarningAlarmHigh")
+    warn_alarm_low = _get_prop(interfaces, "xyz.openbmc_project.Sensor.Threshold.Warning", "WarningAlarmLow")
+
+    thresholds: dict[str, float] = {}
+    if _is_valid_finite(crit_high):
+        thresholds["CriticalHigh"] = float(crit_high)
+    if _is_valid_finite(crit_low):
+        thresholds["CriticalLow"] = float(crit_low)
+    if _is_valid_finite(warn_high):
+        thresholds["WarningHigh"] = float(warn_high)
+    if _is_valid_finite(warn_low):
+        thresholds["WarningLow"] = float(warn_low)
+
+    val_is_finite = _is_valid_finite(raw_val)
+    val_num = float(raw_val) if val_is_finite else None
+
+    # Determine HealthState and status
+    if not available:
+        health = HealthState.UNAVAILABLE
+        status = "unavailable"
+    elif not val_is_finite:
+        health = HealthState.UNAVAILABLE
+        status = "unavailable"
+    elif not functional:
+        health = HealthState.CRITICAL
+        status = "critical"
+    elif bool(crit_alarm_high) or bool(crit_alarm_low):
+        health = HealthState.CRITICAL
+        status = "critical"
+    elif "CriticalHigh" in thresholds and val_num is not None and val_num >= thresholds["CriticalHigh"]:
+        health = HealthState.CRITICAL
+        status = "critical"
+    elif "CriticalLow" in thresholds and val_num is not None and val_num <= thresholds["CriticalLow"]:
+        health = HealthState.CRITICAL
+        status = "critical"
+    elif bool(warn_alarm_high) or bool(warn_alarm_low):
+        health = HealthState.WARNING
+        status = "warning"
+    elif "WarningHigh" in thresholds and val_num is not None and val_num >= thresholds["WarningHigh"]:
+        health = HealthState.WARNING
+        status = "warning"
+    elif "WarningLow" in thresholds and val_num is not None and val_num <= thresholds["WarningLow"]:
+        health = HealthState.WARNING
+        status = "warning"
+    else:
+        health = HealthState.NORMAL
+        status = "ok"
+
+    return Sensor(
+        name=name,
+        status=status,
+        health=health,
+        group=group_name(name),
+        raw_status=status,
+        value=val_num,
+        functional=functional,
+        available=available,
+        unit=str(unit),
+        path=path,
+        thresholds=thresholds if thresholds else None,
+    )
+
+
+def parse_dbus_managed_objects(managed_objects: dict[str, Any]) -> dict[str, Sensor]:
+    result: dict[str, Sensor] = {}
+    if not isinstance(managed_objects, dict):
+        return result
+    for path, interfaces in managed_objects.items():
+        if not isinstance(interfaces, dict):
+            continue
+        try:
+            sensor = parse_dbus_sensor(path, interfaces)
+            result[sensor.name] = sensor
+        except Exception:
+            continue
+    return result
+
+
+def parse_dbus_snapshot(text: str) -> dict[str, Sensor]:
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Snapshot text must not be empty")
+
+    try:
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except (ValueError, RecursionError) as e:
+        raise ValueError(f"Invalid JSON snapshot: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("Top-level snapshot must be a JSON object")
+
+    if not data:
+        raise ValueError("Snapshot must not be empty")
+
+    if "type" in data and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+        managed = data["data"][0]
+        if isinstance(managed, dict):
+            return parse_dbus_managed_objects(managed)
+
+    first_key = next(iter(data.keys()))
+    if first_key.startswith("/"):
+        return parse_dbus_managed_objects(data)
+
+    return parse_snapshot(text)
+
+
 def parse_snapshot(text: str) -> dict[str, Sensor]:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Snapshot text must not be empty")
@@ -117,10 +290,38 @@ def parse_snapshot(text: str) -> dict[str, Sensor]:
     if not data:
         raise ValueError("Snapshot must not be empty")
 
+    if "type" in data and "data" in data and isinstance(data["data"], list):
+        return parse_dbus_snapshot(text)
+
+    first_key = next(iter(data.keys())) if data else ""
+    if first_key.startswith("/"):
+        return parse_dbus_managed_objects(data)
+
     result: dict[str, Sensor] = {}
     for name, item in data.items():
         if not isinstance(item, dict):
             raise ValueError(f"Sensor entry {name} must be a dict")
+
+        if "health" in item:
+            health = HealthState(str(item["health"]).lower())
+            raw_st = str(item.get("raw_status", item.get("status", "unknown")))
+            st = str(item.get("status", "unknown"))
+            val = item.get("value")
+            val_num = float(val) if _is_valid_finite(val) else None
+            result[name] = Sensor(
+                name=name,
+                status=st,
+                health=health,
+                group=tuple(item["group"]) if "group" in item and isinstance(item["group"], (list, tuple)) else group_name(name),
+                raw_status=raw_st,
+                value=val_num,
+                functional=bool(item.get("functional", True)),
+                available=bool(item.get("available", True)),
+                unit=str(item.get("unit", "")),
+                path=str(item.get("path", "")),
+                thresholds=item.get("thresholds"),
+            )
+            continue
 
         if "status" in item and item["status"] is not None:
             raw_st = str(item["status"])
@@ -151,6 +352,7 @@ def parse_snapshot(text: str) -> dict[str, Sensor]:
             health=health,
             group=group_name(name),
             raw_status=raw_st,
+            value=float(val) if _is_valid_finite(val) else None,
         )
 
     return result
@@ -223,6 +425,12 @@ class Tracker:
                     health="unknown",
                     group=s.group,
                     raw_status=s.raw_status,
+                    value=s.value,
+                    functional=s.functional,
+                    available=s.available,
+                    unit=s.unit,
+                    path=s.path,
+                    thresholds=s.thresholds,
                 ))
             else:
                 out.append(s)

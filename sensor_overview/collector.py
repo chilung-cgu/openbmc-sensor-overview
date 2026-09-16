@@ -10,7 +10,7 @@ import subprocess
 import threading
 import time
 
-__all__ = ["CollectionError", "Collector", "ssh_command"]
+__all__ = ["CollectionError", "Collector", "DBusCollector", "ssh_command", "dbus_ssh_command"]
 
 DISALLOWED_SHELL_CHARS = set(";`&|*?~<>^()${}\"'\\")
 
@@ -72,6 +72,29 @@ def _validate_identity(identity: str) -> None:
     if not isinstance(identity, str) or not identity.strip() or identity.startswith("-") or "\0" in identity:
         raise ValueError("identity must be a valid file path and cannot start with '-'")
 
+
+
+def dbus_ssh_command(host: str, remote_cmd: str, port: int = 22, identity: str | None = None) -> list[str]:
+    _validate_host(host)
+    _validate_port(port)
+    if identity is not None:
+        _validate_identity(identity)
+    if not isinstance(remote_cmd, str) or not remote_cmd.strip():
+        raise ValueError("remote_cmd must be a non-empty string")
+
+    args = [
+        "ssh",
+        "-T",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=2",
+        "-p", str(port),
+    ]
+    if identity:
+        args += ["-i", identity]
+    args += [host, remote_cmd]
+    return args
 
 def ssh_command(host: str, port: int = 22, identity: str | None = None) -> list[str]:
     _validate_host(host)
@@ -290,3 +313,265 @@ class Collector:
             raise CollectionError(msg)
 
         return stdout_data
+
+
+class DBusCollector:
+    """Collects OpenBMC sensor readings using standard D-Bus interfaces.
+
+    Queries ObjectMapper for all objects implementing xyz.openbmc_project.Sensor.Value,
+    then batches calls to org.freedesktop.DBus.ObjectManager.GetManagedObjects for each daemon.
+    Falls back to org.freedesktop.DBus.Properties.GetAll when a daemon does not support ObjectManager.
+    """
+
+    def __init__(
+        self,
+        *,
+        host: str | None = None,
+        local: bool = False,
+        port: int = 22,
+        identity: str | None = None,
+        timeout: float = 15.0,
+        per_daemon_timeout: float = 3.0,
+        cmd_runner: Any = None,
+    ) -> None:
+        if host and local:
+            raise ValueError("Cannot specify both host and local")
+        if not host and not local:
+            if cmd_runner is None:
+                raise ValueError("Either host or local must be specified")
+            local = True
+
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a positive finite number")
+        if not isinstance(per_daemon_timeout, (int, float)) or isinstance(per_daemon_timeout, bool) or not math.isfinite(per_daemon_timeout) or per_daemon_timeout <= 0:
+            raise ValueError("per_daemon_timeout must be a positive finite number")
+
+        _validate_port(port)
+        if host is not None:
+            _validate_host(host)
+            if identity is not None:
+                _validate_identity(identity)
+
+        self.host = host
+        self.local = local
+        self.port = port
+        self.identity = identity
+        self.timeout = float(timeout)
+        self.per_daemon_timeout = float(per_daemon_timeout)
+        self.cmd_runner = cmd_runner
+
+    def _exec(self, cmd: list[str], timeout: float) -> tuple[int, str, str]:
+        if self.cmd_runner is not None:
+            return self.cmd_runner(cmd, timeout)
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return (proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            raise TimeoutError(f"Command timed out after {timeout}s")
+        except Exception as e:
+            _kill_process_group(proc)
+            raise CollectionError(f"Failed to execute command {cmd[0]}: {e}") from e
+
+    def _make_cmd(self, remote_cmd: str, local_args: list[str]) -> list[str]:
+        if self.host is not None:
+            return dbus_ssh_command(self.host, remote_cmd, port=self.port, identity=self.identity)
+        return local_args
+
+    def collect_sensors(self, stop: threading.Event) -> dict[str, Any]:
+        if stop.is_set():
+            raise CollectionError("Collection cancelled by stop event")
+
+        from sensor_overview.model import (
+            HealthState,
+            Sensor,
+            group_name,
+            parse_dbus_managed_objects,
+            parse_dbus_sensor,
+        )
+
+        subtree_call = (
+            "busctl --json=pretty call xyz.openbmc_project.ObjectMapper "
+            "/xyz/openbmc_project/object_mapper xyz.openbmc_project.ObjectMapper "
+            "GetSubTree sias /xyz/openbmc_project/sensors 0 1 xyz.openbmc_project.Sensor.Value"
+        )
+        local_subtree = [
+            "busctl", "--json=pretty", "call",
+            "xyz.openbmc_project.ObjectMapper",
+            "/xyz/openbmc_project/object_mapper",
+            "xyz.openbmc_project.ObjectMapper",
+            "GetSubTree", "sias", "/xyz/openbmc_project/sensors", "0", "1",
+            "xyz.openbmc_project.Sensor.Value",
+        ]
+        cmd = self._make_cmd(subtree_call, local_subtree)
+
+        try:
+            rc, stdout, stderr = self._exec(cmd, timeout=self.timeout)
+        except TimeoutError as e:
+            raise CollectionError(f"D-Bus GetSubTree timed out after {self.timeout}s") from e
+        except Exception as e:
+            raise CollectionError(f"Failed to query ObjectMapper: {e}") from e
+
+        if rc != 0:
+            raise CollectionError(f"ObjectMapper GetSubTree failed (exit {rc}): {stderr.strip()}")
+
+        try:
+            data = json.loads(stdout)
+        except Exception as e:
+            raise CollectionError(f"Failed to parse ObjectMapper response: {e}") from e
+
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+            tree = data["data"][0]
+        elif isinstance(data, dict):
+            tree = data
+        else:
+            tree = {}
+
+        if not tree or not isinstance(tree, dict):
+            raise CollectionError("No sensor subtree found (empty ObjectMapper response)")
+
+        service_to_paths: dict[str, list[str]] = {}
+        for path, srv_map in tree.items():
+            if isinstance(srv_map, dict):
+                for srv in srv_map.keys():
+                    service_to_paths.setdefault(srv, []).append(path)
+
+        sensors: dict[str, Sensor] = {}
+
+        for srv in sorted(service_to_paths.keys()):
+            if stop.is_set():
+                raise CollectionError("Collection cancelled by stop event")
+
+            paths = service_to_paths[srv]
+            managed_call = f"busctl --json=pretty call {srv} /xyz/openbmc_project/sensors org.freedesktop.DBus.ObjectManager GetManagedObjects"
+            local_managed = ["busctl", "--json=pretty", "call", srv, "/xyz/openbmc_project/sensors", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]
+            cmd = self._make_cmd(managed_call, local_managed)
+
+            use_fallback = False
+            try:
+                rc, stdout, stderr = self._exec(cmd, timeout=self.per_daemon_timeout)
+                if rc == 0:
+                    mdata = json.loads(stdout)
+                    if isinstance(mdata, dict) and "data" in mdata and isinstance(mdata["data"], list) and len(mdata["data"]) > 0:
+                        objs = mdata["data"][0]
+                    elif isinstance(mdata, dict):
+                        objs = mdata
+                    else:
+                        objs = {}
+                    parsed_sensors = parse_dbus_managed_objects(objs)
+                    for s in parsed_sensors.values():
+                        sensors[s.name] = s
+                    continue
+                else:
+                    if "UnknownMethod" in stderr or "UnknownMethod" in stdout:
+                        use_fallback = True
+                    else:
+                        for p in paths:
+                            sname = p.rstrip("/").split("/")[-1]
+                            sensors[sname] = Sensor(
+                                name=sname,
+                                status="unavailable",
+                                health=HealthState.UNAVAILABLE,
+                                group=group_name(sname),
+                                raw_status=f"Daemon error: {stderr.strip() or ('exit code ' + str(rc))}",
+                                available=False,
+                                functional=False,
+                                path=p,
+                            )
+                        continue
+            except TimeoutError as te:
+                for p in paths:
+                    sname = p.rstrip("/").split("/")[-1]
+                    sensors[sname] = Sensor(
+                        name=sname,
+                        status="unavailable",
+                        health=HealthState.UNAVAILABLE,
+                        group=group_name(sname),
+                        raw_status=f"Daemon timeout: {te}",
+                        available=False,
+                        functional=False,
+                        path=p,
+                    )
+                continue
+            except Exception as e:
+                for p in paths:
+                    sname = p.rstrip("/").split("/")[-1]
+                    sensors[sname] = Sensor(
+                        name=sname,
+                        status="unavailable",
+                        health=HealthState.UNAVAILABLE,
+                        group=group_name(sname),
+                        raw_status=f"Daemon call failed: {e}",
+                        available=False,
+                        functional=False,
+                        path=p,
+                    )
+                continue
+
+            if use_fallback:
+                for p in paths:
+                    if stop.is_set():
+                        raise CollectionError("Collection cancelled by stop event")
+                    sname = p.rstrip("/").split("/")[-1]
+                    getall_call = f'busctl --json=pretty call {srv} {p} org.freedesktop.DBus.Properties GetAll s ""'
+                    local_getall = ["busctl", "--json=pretty", "call", srv, p, "org.freedesktop.DBus.Properties", "GetAll", "s", ""]
+                    cmd = self._make_cmd(getall_call, local_getall)
+                    try:
+                        rc_prop, out_prop, err_prop = self._exec(cmd, timeout=self.per_daemon_timeout)
+                        if rc_prop == 0:
+                            pdata = json.loads(out_prop)
+                            if isinstance(pdata, dict) and "data" in pdata and isinstance(pdata["data"], list) and len(pdata["data"]) > 0:
+                                props = pdata["data"][0]
+                            elif isinstance(pdata, dict):
+                                props = pdata
+                            else:
+                                props = {}
+                            sensor = parse_dbus_sensor(p, props)
+                            sensors[sensor.name] = sensor
+                        else:
+                            sensors[sname] = Sensor(
+                                name=sname,
+                                status="unavailable",
+                                health=HealthState.UNAVAILABLE,
+                                group=group_name(sname),
+                                raw_status=f"GetAll error: {err_prop.strip()}",
+                                available=False,
+                                functional=False,
+                                path=p,
+                            )
+                    except Exception as e:
+                        sensors[sname] = Sensor(
+                            name=sname,
+                            status="unavailable",
+                            health=HealthState.UNAVAILABLE,
+                            group=group_name(sname),
+                            raw_status=f"GetAll failed: {e}",
+                            available=False,
+                            functional=False,
+                            path=p,
+                        )
+
+        return sensors
+
+    def collect(self, stop: threading.Event) -> str:
+        sensors = self.collect_sensors(stop)
+        data = {
+            s.name: {
+                "status": s.status,
+                "health": str(s.health),
+                "value": s.value,
+                "path": s.path,
+                "raw_status": s.raw_status,
+            }
+            for s in sensors.values()
+        }
+        return json.dumps(data)
