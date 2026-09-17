@@ -402,6 +402,11 @@ def _tui_main(
                 engine=state.matrix_engine,
                 color_map=color_map,
                 use_unicode=True,
+                source_label=source_label,
+                conn_status=conn_status,
+                age=age,
+                last_duration=last_duration,
+                stale_after=tracker.stale_after,
             )
         else:
             # Header lines (0, 1, 2)

@@ -408,5 +408,29 @@ class TestMatrixView(unittest.TestCase):
         self.assertIn("All Sensors Normal", buffer_str)
 
 
+    def test_render_matrix_view_with_connection_metadata(self):
+        """Test render_matrix_view correctly formats Conn, Age, and Query in header."""
+        win = MockCursesWindow(height=30, width=140)
+        sensors = [
+            self._make_sensor("TEMP_1", status="ok", health="normal"),
+            self._make_sensor("TEMP_2", status="critical", health="critical"),
+        ]
+        state = self.MatrixState()
+        self.render_matrix_view(
+            win,
+            sensors,
+            state=state,
+            source_label="SSH:root@192.0.2.1",
+            conn_status="Connected",
+            age=1.5,
+            last_duration=2.75,
+            stale_after=30.0,
+        )
+        first_line = "".join(win.buffer[0])
+        self.assertIn("Conn: Connected", first_line)
+        self.assertIn("Age: 1.5s", first_line)
+        self.assertIn("Query: 2.75s", first_line)
+
+
 if __name__ == "__main__":
     unittest.main()

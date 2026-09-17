@@ -561,6 +561,11 @@ def render_matrix_view(
     engine: MatrixLayoutEngine | None = None,
     color_map: dict[int, int] | None = None,
     use_unicode: bool = True,
+    source_label: str | None = None,
+    conn_status: str | None = None,
+    age: float | None = None,
+    last_duration: float | None = None,
+    stale_after: float | None = None,
 ) -> None:
     """Render high-density matrix view and HUD to a curses window."""
     max_y, max_x = win.getmaxyx()
@@ -597,7 +602,21 @@ def render_matrix_view(
     n_unav = sum(1 for s in sensors if get_sensor_severity(s) == SEVERITY_UNAVAILABLE)
 
     h0 = f" SENSOR MATRIX [{layout.mode.upper()}] "
-    safe_addstr(win, 0, 0, (h0 + "=" * max(0, max_x - len(h0)))[:max_x])
+    if source_label is not None or conn_status is not None or age is not None:
+        if age is None:
+            age_str = "--"
+        elif stale_after is not None and age > stale_after:
+            age_str = f"STALE ({age:.1f}s)"
+        else:
+            age_str = f"{age:.1f}s"
+        dur_str = f"{last_duration:.2f}s" if last_duration is not None else "--"
+        c_status = conn_status or "Connected"
+        meta_str = f" [Conn: {c_status}] [Age: {age_str}] [Query: {dur_str}]"
+        rem_len = max(0, max_x - len(h0) - len(meta_str))
+        h0_line = h0 + ("=" * rem_len) + meta_str
+    else:
+        h0_line = h0 + ("=" * max(0, max_x - len(h0)))
+    safe_addstr(win, 0, 0, h0_line[:max_x])
     h1 = f" Total: {tot} | OK: {n_norm} | Warn: {n_warn} | Crit: {n_crit} | Unavail: {n_unav}"
     safe_addstr(win, 1, 0, h1[:max_x])
 

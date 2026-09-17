@@ -111,6 +111,9 @@ def _build_ssh_base(
         "-o", "ConnectTimeout=5",
         "-o", "ServerAliveInterval=5",
         "-o", "ServerAliveCountMax=2",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=/tmp/.sensor_overview_ssh_%C",
+        "-o", "ControlPersist=60s",
         "-p", str(port),
     ]
     if identity:
@@ -379,8 +382,8 @@ class DBusCollector:
         port: int = 22,
         identity: str | None = None,
         password: str | None = None,
-        timeout: float = 15.0,
-        per_daemon_timeout: float = 3.0,
+        timeout: float = 30.0,
+        per_daemon_timeout: float = 15.0,
         cmd_runner: Any = None,
     ) -> None:
         if host and local:
@@ -406,8 +409,8 @@ class DBusCollector:
         self.port = port
         self.identity = identity
         self.password = password
-        self.timeout = float(timeout)
-        self.per_daemon_timeout = float(per_daemon_timeout)
+        self.timeout = max(float(timeout), 5.0)
+        self.per_daemon_timeout = max(float(per_daemon_timeout), float(self.timeout))
         self.cmd_runner = cmd_runner
 
     def _exec(self, cmd: list[str], timeout: float) -> tuple[int, str, str]:
@@ -517,10 +520,11 @@ class DBusCollector:
                     service_to_paths.setdefault(srv, []).append(path)
 
         sensors: dict[str, Sensor] = {}
+        sensors_lock = threading.Lock()
 
-        for srv in sorted(service_to_paths.keys()):
+        def _query_service(srv: str) -> None:
             if stop.is_set():
-                raise CollectionError("Collection cancelled by stop event")
+                return
 
             paths = service_to_paths[srv]
             managed_call = f"busctl --json=pretty call {srv} /xyz/openbmc_project/sensors org.freedesktop.DBus.ObjectManager GetManagedObjects"
@@ -539,59 +543,63 @@ class DBusCollector:
                     else:
                         objs = {}
                     parsed_sensors = parse_dbus_managed_objects(objs)
-                    for s in parsed_sensors.values():
-                        sensors[s.name] = s
-                    continue
+                    with sensors_lock:
+                        for s in parsed_sensors.values():
+                            sensors[s.name] = s
+                    return
                 else:
                     if "UnknownMethod" in stderr or "UnknownMethod" in stdout:
                         use_fallback = True
                     else:
-                        for p in paths:
-                            sname = p.rstrip("/").split("/")[-1]
-                            sensors[sname] = Sensor(
-                                name=sname,
-                                status="unavailable",
-                                health=HealthState.UNAVAILABLE,
-                                group=group_name(sname),
-                                raw_status=f"Daemon error: {stderr.strip() or ('exit code ' + str(rc))}",
-                                available=False,
-                                functional=False,
-                                path=p,
-                            )
-                        continue
+                        with sensors_lock:
+                            for p in paths:
+                                sname = p.rstrip("/").split("/")[-1]
+                                sensors[sname] = Sensor(
+                                    name=sname,
+                                    status="unavailable",
+                                    health=HealthState.UNAVAILABLE,
+                                    group=group_name(sname),
+                                    raw_status=f"Daemon error: {stderr.strip() or ('exit code ' + str(rc))}",
+                                    available=False,
+                                    functional=False,
+                                    path=p,
+                                )
+                        return
             except TimeoutError as te:
-                for p in paths:
-                    sname = p.rstrip("/").split("/")[-1]
-                    sensors[sname] = Sensor(
-                        name=sname,
-                        status="unavailable",
-                        health=HealthState.UNAVAILABLE,
-                        group=group_name(sname),
-                        raw_status=f"Daemon timeout: {te}",
-                        available=False,
-                        functional=False,
-                        path=p,
-                    )
-                continue
+                with sensors_lock:
+                    for p in paths:
+                        sname = p.rstrip("/").split("/")[-1]
+                        sensors[sname] = Sensor(
+                            name=sname,
+                            status="unavailable",
+                            health=HealthState.UNAVAILABLE,
+                            group=group_name(sname),
+                            raw_status=f"Daemon timeout: {te}",
+                            available=False,
+                            functional=False,
+                            path=p,
+                        )
+                return
             except Exception as e:
-                for p in paths:
-                    sname = p.rstrip("/").split("/")[-1]
-                    sensors[sname] = Sensor(
-                        name=sname,
-                        status="unavailable",
-                        health=HealthState.UNAVAILABLE,
-                        group=group_name(sname),
-                        raw_status=f"Daemon call failed: {e}",
-                        available=False,
-                        functional=False,
-                        path=p,
-                    )
-                continue
+                with sensors_lock:
+                    for p in paths:
+                        sname = p.rstrip("/").split("/")[-1]
+                        sensors[sname] = Sensor(
+                            name=sname,
+                            status="unavailable",
+                            health=HealthState.UNAVAILABLE,
+                            group=group_name(sname),
+                            raw_status=f"Daemon call failed: {e}",
+                            available=False,
+                            functional=False,
+                            path=p,
+                        )
+                return
 
             if use_fallback:
                 for p in paths:
                     if stop.is_set():
-                        raise CollectionError("Collection cancelled by stop event")
+                        return
                     sname = p.rstrip("/").split("/")[-1]
                     getall_call = f'busctl --json=pretty call {srv} {p} org.freedesktop.DBus.Properties GetAll s ""'
                     local_getall = ["busctl", "--json=pretty", "call", srv, p, "org.freedesktop.DBus.Properties", "GetAll", "s", ""]
@@ -607,29 +615,47 @@ class DBusCollector:
                             else:
                                 props = {}
                             sensor = parse_dbus_sensor(p, props)
-                            sensors[sensor.name] = sensor
+                            with sensors_lock:
+                                sensors[sensor.name] = sensor
                         else:
+                            with sensors_lock:
+                                sensors[sname] = Sensor(
+                                    name=sname,
+                                    status="unavailable",
+                                    health=HealthState.UNAVAILABLE,
+                                    group=group_name(sname),
+                                    raw_status=f"GetAll error: {err_prop.strip()}",
+                                    available=False,
+                                    functional=False,
+                                    path=p,
+                                )
+                    except Exception as e:
+                        with sensors_lock:
                             sensors[sname] = Sensor(
                                 name=sname,
                                 status="unavailable",
                                 health=HealthState.UNAVAILABLE,
                                 group=group_name(sname),
-                                raw_status=f"GetAll error: {err_prop.strip()}",
+                                raw_status=f"GetAll failed: {e}",
                                 available=False,
                                 functional=False,
                                 path=p,
                             )
-                    except Exception as e:
-                        sensors[sname] = Sensor(
-                            name=sname,
-                            status="unavailable",
-                            health=HealthState.UNAVAILABLE,
-                            group=group_name(sname),
-                            raw_status=f"GetAll failed: {e}",
-                            available=False,
-                            functional=False,
-                            path=p,
-                        )
+
+        import concurrent.futures
+        max_workers = min(8, len(service_to_paths)) if service_to_paths else 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_query_service, srv) for srv in sorted(service_to_paths.keys())]
+            for future in concurrent.futures.as_completed(futures):
+                if stop.is_set():
+                    break
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+        if stop.is_set():
+            raise CollectionError("Collection cancelled by stop event")
 
         return sensors
 

@@ -12,8 +12,11 @@ OpenBMC 感測器動態健康總覽工具。專為管理大量感測器（數百
 - **雙資料收集後端（Backends）**：
   - **標準 D-Bus 後端 (`--backend dbus`)**：直接透過 `busctl` 查詢上游標準 OpenBMC D-Bus 物件樹（`/xyz/openbmc_project/sensors`），讀取數值、警告／嚴重門檻、Alarm 旗標及 Functional／Available 狀態，適用於標準 OpenBMC 架構。
   - **mfg-tool 後端 (`--backend mfg-tool`)**：相容既有診斷工具 `mfg-tool sensor-display` 輸出的 JSON 資料格式。
+- **高效併發收集與連線復用（High Performance Transport）**：
+  - **SSH 連線多工 (Connection Multiplexing)**：底層啟用 OpenSSH `ControlMaster=auto` 與 `ControlPersist=60s`，共享單一 Master SSH 連線通道，消除反覆交握開銷。
+  - **D-Bus 跨 Daemon 平行併發查詢**：以執行緒池（最多 8 個 worker）同時向各感測器 daemon 擷取資料，各 daemon 相互隔離，大幅降低多 daemon 系統（如 PLDM、Hwmon、ADC）的輪詢延遲。
 - **雙展示模式（View Modes）**：
-  - **密集矩陣視圖 (Matrix View)**：高密度網格呈現所有感測器狀態，提供 HUD 頂部狀態列、異常感測器 Tab 快速跳轉、嚴重視重自動鎖定與二維空間遊標導航。
+  - **密集矩陣視圖 (Matrix View)**：高密度網格呈現所有感測器狀態，提供頂部連線心跳與延遲監控（`[Conn: ...]`、`[Age: ...]`、`[Query: ...]`）、HUD 狀態欄、異常感測器 Tab 快速跳轉、嚴重視重自動鎖定與二維空間遊標導航。
   - **可收合樹狀視圖 (Tree View)**：依槽位與子系統（Slot、Fan、Power、Management 等）自動分類，支援展開／收合、異常快速過濾與名稱即時搜尋。
 - **彈性連線機制**：
   - 預設採用 SSH BatchMode 金鑰登入。
@@ -153,7 +156,7 @@ usage: sensor-overview.py [-h] (--demo | --host HOST | --file FILE | --local)
 | `--view` | `matrix` | 啟動初始介面模式：`matrix`（矩陣視圖）或 `tree`（樹狀視圖） |
 | `--interval` | `2.0` | 查詢目標週期（秒） |
 | `--timeout` | `15.0` | 單次查詢逾時限制（秒） |
-| `--stale-after` | `10.0` | 標記資料為過期（stale）的秒數門檻 |
+| `--stale-after` | `30.0` | 標記資料為過期（stale）的秒數門檻 |
 | `--port` | `22` | SSH 連線連接埠 |
 | `--identity` | - | SSH 私鑰檔案路徑 |
 | `--password` | - | SSH 密碼（可選；若未填且認證被拒，自動以 `0penBmc` 降級重試） |
@@ -179,6 +182,6 @@ usage: sensor-overview.py [-h] (--demo | --host HOST | --file FILE | --local)
 專案包含完整的單元測試與端對端互動測試：
 
 ```bash
-# 執行全套測試套件（114 項測試）
+# 執行全套測試套件（115 項測試）
 python3 -m unittest discover -s tests -v
 ```

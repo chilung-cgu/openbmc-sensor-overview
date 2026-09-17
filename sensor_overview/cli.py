@@ -24,7 +24,7 @@ def strip_control_codes(s: str) -> str:
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Yosemite4 Sensor Dynamic Health Overview",
+        description="OpenBMC Sensor Dynamic Health Overview",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     src_group = parser.add_mutually_exclusive_group(required=True)
@@ -37,7 +37,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--view", choices=["matrix", "tree"], default="matrix", help="Initial display view mode (matrix or tree)")
     parser.add_argument("--interval", type=float, default=2.0, help="Polling interval in seconds")
     parser.add_argument("--timeout", type=float, default=15.0, help="Query timeout in seconds")
-    parser.add_argument("--stale-after", type=float, default=10.0, help="Stale threshold in seconds")
+    parser.add_argument("--stale-after", type=float, default=30.0, help="Stale threshold in seconds")
     parser.add_argument("--port", type=int, default=22, help="SSH port")
     parser.add_argument("--identity", type=str, default=None, help="SSH identity key file")
     parser.add_argument("--password", type=str, default=None, help="SSH password (optional; auto-attempts 0penBmc if key fails)")
@@ -157,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
                 identity=args.identity,
                 password=args.password,
                 timeout=args.timeout,
+                per_daemon_timeout=args.timeout,
             )
         else:
             collector = Collector(
@@ -174,7 +175,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        tracker = Tracker(stale_after=args.stale_after)
+        effective_stale = max(args.stale_after, args.timeout * 2.0, 30.0)
+        tracker = Tracker(stale_after=effective_stale)
     except ValueError as ve:
         sys.stderr.write(f"Error: {strip_control_codes(str(ve))}\n")
         return 2
